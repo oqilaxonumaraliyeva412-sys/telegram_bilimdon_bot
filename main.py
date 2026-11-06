@@ -11,7 +11,10 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # BOT TOKEN (Render / .env o'zgaruvchisidan olinadi)
-TOKEN = os.getenv("BOT_TOKEN", "9137423041:AAEBtoJnEwBcPV5s9yRqbbaZU02T28HvduE")
+TOKEN = os.getenv("BOT_TOKEN")
+
+if not TOKEN:
+    raise ValueError("BOT_TOKEN topilmadi! Iltimos, .env faylida yoki Render Environment Variables qismida BOT_TOKEN ni o'rnating.")
 
 bot = telebot.TeleBot(TOKEN)
 

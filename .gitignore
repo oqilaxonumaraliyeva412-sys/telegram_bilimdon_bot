@@ -3,4 +3,7 @@ __pycache__/
 *.pyc
 .idea/
 .env
+*.db
+desktop.ini
+
 
