@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: bilimdon-telegram-bot
+    name: telegram-bot-narxlari
     runtime: python
     buildCommand: pip install -r requirements.txt
     startCommand: python main.py
@@ -8,4 +8,3 @@ services:
     envVars:
       - key: BOT_TOKEN
         sync: false
-

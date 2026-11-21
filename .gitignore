@@ -5,5 +5,4 @@ __pycache__/
 .env
 *.db
 desktop.ini
-
-
+*.sqlite3

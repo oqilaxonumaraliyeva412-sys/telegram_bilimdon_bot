@@ -1,412 +1,335 @@
-
 import os
-import random
 import sqlite3
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
+
 import telebot
+from telebot import types
 from dotenv import load_dotenv
 
-# .env faylini yuklash
 load_dotenv()
 
-# BOT TOKEN (Render / .env o'zgaruvchisidan olinadi)
 TOKEN = os.getenv("BOT_TOKEN")
+ADMIN_ID = os.getenv("ADMIN_ID")  # ixtiyoriy admin ID
 
 if not TOKEN:
-    raise ValueError("BOT_TOKEN topilmadi! Iltimos, .env faylida yoki Render Environment Variables qismida BOT_TOKEN ni o'rnating.")
+    raise ValueError("BOT_TOKEN topilmadi! .env faylini tekshiring.")
 
 bot = telebot.TeleBot(TOKEN)
 
 # DATABASE
-db = sqlite3.connect("bilimdon.db", check_same_thread=False)
+db = sqlite3.connect("services.db", check_same_thread=False)
 cursor = db.cursor()
+db_lock = threading.Lock()
 
-cursor.execute("""
-CREATE TABLE IF NOT EXISTS users (
-    user_id INTEGER PRIMARY KEY,
-    name TEXT,
-    xp INTEGER DEFAULT 0,
-    tests INTEGER DEFAULT 0,
-    correct INTEGER DEFAULT 0
-)
-""")
-db.commit()
-
-# 15 TA FAN
-subjects = [
-    "📐 Matematika",
-    "🌍 Geografiya",
-    "📜 Tarix",
-    "🇬🇧 Ingliz tili",
-    "🧬 Biologiya",
-    "⚗️ Kimyo",
-    "⚡ Fizika",
-    "📖 Ona tili",
-    "📚 Adabiyot",
-    "💻 Informatika",
-    "🏛️ Huquq",
-    "🌱 Tabiatshunoslik",
-    "🕌 Tarbiya",
-    "🎨 San'at",
-    "🧠 Mantiq"
-]
-
-# FOYDALANUVCHI TESTLARI
-sessions = {}
-
-
-def register_user(user):
-    cursor.execute(
-        "INSERT OR IGNORE INTO users (user_id, name) VALUES (?, ?)",
-        (user.id, user.first_name)
-    )
-    db.commit()
-
-
-# MATEMATIKA UCHUN SAVOLLAR YARATISH
-def generate_math_questions():
-    questions = []
-
-    for i in range(30):
-        a = random.randint(5, 100)
-        b = random.randint(2, 30)
-
-        operation = random.choice(["+", "-", "*"])
-
-        if operation == "+":
-            answer = a + b
-            question = f"{a} + {b} = ?"
-
-        elif operation == "-":
-            answer = a - b
-            question = f"{a} - {b} = ?"
-
-        else:
-            answer = a * b
-            question = f"{a} × {b} = ?"
-
-        options = {answer}
-
-        while len(options) < 4:
-            options.add(answer + random.randint(-20, 20))
-
-        options = list(options)
-        random.shuffle(options)
-
-        questions.append({
-            "question": question,
-            "options": options,
-            "answer": answer
-        })
-
-    return questions
-
-
-# ASOSIY MENYU
-def main_menu():
-    markup = telebot.types.ReplyKeyboardMarkup(
-        resize_keyboard=True
-    )
-
-    markup.row("📚 Fanlarni tanlash")
-    markup.row("🏆 Mening natijam", "🥇 Reyting")
-    markup.row("ℹ️ Bot haqida")
-
-    return markup
-
-
-# FANLAR MENYUSI
-def subjects_menu():
-    markup = telebot.types.InlineKeyboardMarkup(row_width=2)
-
-    for i, subject in enumerate(subjects):
-        markup.add(
-            telebot.types.InlineKeyboardButton(
-                subject,
-                callback_data=f"subject_{i}"
-            )
-        )
-
-    return markup
-
-
-# TESTNI BOSHLASH
-def start_test(call, subject_index):
-    user_id = call.from_user.id
-    subject = subjects[subject_index]
-
-    if subject_index != 0:
-        bot.send_message(
-            user_id,
-            f"{subject} savollari tayyorlanmoqda. "
-            "Hozircha matematika testini ishlashing mumkin."
-        )
-        return
-
-    questions = generate_math_questions()
-
-    sessions[user_id] = {
-        "questions": questions,
-        "current": 0,
-        "correct": 0,
-        "subject": subject
-    }
-
-    bot.send_message(
-        user_id,
-        f"🎓 {subject}\n"
-        "Test boshlandi!\n\n"
-        "Jami: 30 ta savol.\n"
-        "Har bir to'g'ri javob = 1 ball."
-    )
-
-    send_question(user_id)
-
-
-# SAVOLNI CHIQARISH
-def send_question(user_id):
-    session = sessions[user_id]
-
-    index = session["current"]
-    question = session["questions"][index]
-
-    markup = telebot.types.InlineKeyboardMarkup(row_width=2)
-
-    for option in question["options"]:
-        markup.add(
-            telebot.types.InlineKeyboardButton(
-                str(option),
-                callback_data=f"answer_{option}"
-            )
-        )
-
-    bot.send_message(
-        user_id,
-        f"📝 Savol {index + 1}/30\n\n"
-        f"{question['question']}",
-        reply_markup=markup
-    )
-
-
-# JAVOBLARNI TEKSHIRISH
-@bot.callback_query_handler(
-    func=lambda call: call.data.startswith("answer_")
-)
-def check_answer(call):
-    user_id = call.from_user.id
-
-    if user_id not in sessions:
-        bot.answer_callback_query(
-            call.id,
-            "Test topilmadi!"
-        )
-        return
-
-    session = sessions[user_id]
-
-    index = session["current"]
-    question = session["questions"][index]
-
-    selected = int(call.data.split("_")[1])
-
-    if selected == question["answer"]:
-        session["correct"] += 1
-        bot.answer_callback_query(
-            call.id,
-            "✅ To'g'ri javob!"
-        )
-    else:
-        bot.answer_callback_query(
-            call.id,
-            "❌ Noto'g'ri javob!"
-        )
-
-    try:
-        bot.edit_message_reply_markup(
-            user_id,
-            call.message.message_id,
-            reply_markup=None
-        )
-    except Exception:
-        pass
-
-    session["current"] += 1
-
-    if session["current"] >= 30:
-        finish_test(user_id)
-    else:
-        send_question(user_id)
-
-
-# TEST YAKUNI
-def finish_test(user_id):
-    session = sessions[user_id]
-
-    correct = session["correct"]
-    wrong = 30 - correct
-    percent = correct * 100 // 30
-
-    xp = correct * 10
-
-    if correct <= 5:
-        grade = "Ko'proq harakat qil! 💪"
-    elif correct <= 10:
-        grade = "Yaxshi, yana mashq qil! 👍"
-    elif correct <= 15:
-        grade = "Juda yaxshi! ⭐"
-    elif correct <= 19:
-        grade = "Ajoyib! 🔥"
-    else:
-        grade = "Mukammal! 🏆"
-
+with db_lock:
     cursor.execute("""
-        UPDATE users
-        SET xp = xp + ?,
-            tests = tests + 1,
-            correct = correct + ?
-        WHERE user_id = ?
-    """, (xp, correct, user_id))
-
+    CREATE TABLE IF NOT EXISTS orders (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER,
+        username TEXT,
+        full_name TEXT,
+        service_type TEXT,
+        price TEXT,
+        phone TEXT,
+        comment TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+    """)
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS users (
+        user_id INTEGER PRIMARY KEY,
+        full_name TEXT,
+        username TEXT
+    )
+    """)
     db.commit()
 
-    bot.send_message(
-        user_id,
-        f"""
-🏆 TEST YAKUNLANDI!
+# Holatlar (oddiy dict)
+user_states = {}
 
-📚 Fan: {session['subject']}
+PRICES = {
+    "tg_bot": {
+        "title": "🤖 Telegram bot yaratish",
+        "price": "80,000 so'm",
+        "desc": (
+            "Oddiy va qulay Telegram bot:\n"
+            "• Menyu va chiroyli tugmalar\n"
+            "• Foydalanuvchilar bilan qulay muloqot\n"
+            "• Ma'lumotlar bazasi (SQLite) va buyurtmalarni saqlash\n"
+            "• Tezkor va barqaror ishlash"
+        )
+    },
+    "tg_bot_hard": {
+        "title": "⚙️ Og'ir (murakkab) Telegram bot",
+        "price": "130,000 so'm",
+        "desc": (
+            "Katta imkoniyatlarga ega og'ir Telegram bot:\n"
+            "• Murakkab mantiq va ko'p bosqichli FSM tizimi\n"
+            "• To'lov tizimlari va tashqi API integratsiyalari\n"
+            "• Kengaytirilgan admin boshqaruvi va statistika\n"
+            "• Serverda 24/7 uzluksiz ishlash imkoniyati"
+        )
+    }
+}
 
-✅ To'g'ri: {correct} ta
-❌ Noto'g'ri: {wrong} ta
+def get_main_keyboard():
+    markup = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
+    btn_bot = types.KeyboardButton("🤖 Telegram bot (80,000 so'm)")
+    btn_hard_bot = types.KeyboardButton("⚙️ Og'ir bot (130,000 so'm)")
+    btn_prices = types.KeyboardButton("💰 Barcha narxlar")
+    btn_order = types.KeyboardButton("✍️ Buyurtma berish")
+    btn_contact = types.KeyboardButton("📞 Bog'lanish")
+    markup.add(btn_bot, btn_hard_bot)
+    markup.add(btn_prices, btn_order)
+    markup.add(btn_contact)
+    return markup
 
-📊 Natija: {correct}/30
-📈 Foiz: {percent}%
-
-⭐ Yig'ilgan XP: +{xp}
-
-{grade}
-        """,
-        reply_markup=main_menu()
+def get_order_inline():
+    markup = types.InlineKeyboardMarkup(row_width=1)
+    markup.add(
+        types.InlineKeyboardButton("🤖 Telegram bot — 80,000 so'm", callback_data="order_tg_bot"),
+        types.InlineKeyboardButton("⚙️ Og'ir Telegram bot — 130,000 so'm", callback_data="order_tg_bot_hard")
     )
+    return markup
 
-    del sessions[user_id]
+@bot.message_handler(commands=['start', 'help'])
+def send_welcome(message):
+    user_id = message.from_user.id
+    full_name = message.from_user.full_name or "Mijoz"
+    username = message.from_user.username or ""
 
+    with db_lock:
+        cursor.execute(
+            "INSERT OR REPLACE INTO users (user_id, full_name, username) VALUES (?, ?, ?)",
+            (user_id, full_name, username)
+        )
+        db.commit()
 
-# START
-@bot.message_handler(commands=["start"])
-def start(message):
-    register_user(message.from_user)
+    text = (
+        f"Assalomu alaykum, {full_name}!\n\n"
+        "Telegram bot yaratish xizmati botiga xush kelibsiz.\n\n"
+        "📌 Bizning narxlar:\n"
+        "• 🤖 **Telegram bot yasash**: 80,000 so'm\n"
+        "• ⚙️ **Og'ir Telegram bot yasash**: 130,000 so'm\n\n"
+        "Kerakli bo'limni tanlang 👇"
+    )
+    bot.send_message(message.chat.id, text, reply_markup=get_main_keyboard(), parse_mode="Markdown")
 
+@bot.message_handler(func=lambda msg: msg.text == "💰 Barcha narxlar")
+def show_all_prices(message):
+    text = (
+        "📊 **Telegram bot yasash narxlari:**\n\n"
+        "1. 🤖 **Telegram bot yasash** — `80,000 so'm`\n"
+        "   - Menyu, tugmalar, aloqa va ma'lumotlar bazasi.\n\n"
+        "2. ⚙️ **Og'ir Telegram bot yasash** — `130,000 so'm`\n"
+        "   - Murakkab tizimlar, API, to'lovlar, maxsus admin boshqaruvi.\n\n"
+        "Buyurtma berish uchun quyidagi tugmani bosing:"
+    )
+    markup = types.InlineKeyboardMarkup()
+    markup.add(types.InlineKeyboardButton("✍️ Buyurtma berish", callback_data="start_order_flow"))
+    bot.send_message(message.chat.id, text, reply_markup=markup, parse_mode="Markdown")
+
+@bot.message_handler(func=lambda msg: msg.text == "🤖 Telegram bot (80,000 so'm)")
+def info_tg_bot(message):
+    item = PRICES["tg_bot"]
+    text = f"**{item['title']}**\n\n💵 **Narxi:** {item['price']}\n\n{item['desc']}"
+    markup = types.InlineKeyboardMarkup()
+    markup.add(types.InlineKeyboardButton("✍️ Buyurtma berish", callback_data="order_tg_bot"))
+    bot.send_message(message.chat.id, text, reply_markup=markup, parse_mode="Markdown")
+
+@bot.message_handler(func=lambda msg: msg.text == "⚙️ Og'ir bot (130,000 so'm)")
+def info_hard_bot(message):
+    item = PRICES["tg_bot_hard"]
+    text = f"**{item['title']}**\n\n💵 **Narxi:** {item['price']}\n\n{item['desc']}"
+    markup = types.InlineKeyboardMarkup()
+    markup.add(types.InlineKeyboardButton("✍️ Buyurtma berish", callback_data="order_tg_bot_hard"))
+    bot.send_message(message.chat.id, text, reply_markup=markup, parse_mode="Markdown")
+
+@bot.message_handler(func=lambda msg: msg.text == "📞 Bog'lanish")
+def contact_info(message):
+    text = (
+        "📞 **Biz bilan bog'lanish:**\n\n"
+        "Savollaringiz yoki buyurtmangiz bo'lsa murojaat qiling:\n\n"
+        "💬 Telegram: @admin\n"
+        "📱 Telefon: +998 (90) 123-45-67\n"
+        "⏰ Ish vaqti: 24/7"
+    )
+    bot.send_message(message.chat.id, text, parse_mode="Markdown")
+
+@bot.message_handler(func=lambda msg: msg.text == "✍️ Buyurtma berish")
+def order_start(message):
     bot.send_message(
         message.chat.id,
-        f"""
-Assalomu alaykum, {message.from_user.first_name}! 👋
-
-📚 BILIMDON BOTga xush kelibsiz!
-
-Bu bot orqali 15 ta fandan
-bilimingizni sinashingiz mumkin.
-
-Har bir testda 30 ta savol mavjud.
-        """,
-        reply_markup=main_menu()
+        "Qaysi xizmat bo'yicha buyurtma bermoqchisiz? Tanlang:",
+        reply_markup=get_order_inline()
     )
 
-
-# MENYU
-@bot.message_handler(func=lambda message: True)
-def menu(message):
-    user_id = message.from_user.id
-
-    if message.text == "📚 Fanlarni tanlash":
-        bot.send_message(
-            user_id,
-            "📚 O'zingizga kerakli fanni tanlang:",
-            reply_markup=subjects_menu()
-        )
-
-    elif message.text == "🏆 Mening natijam":
-        cursor.execute(
-            "SELECT xp, tests, correct FROM users WHERE user_id=?",
-            (user_id,)
-        )
-
-        result = cursor.fetchone()
-
-        if result:
-            xp, tests, correct = result
-
-            bot.send_message(
-                user_id,
-                f"""
-🏆 SIZNING NATIJANGIZ
-
-⭐ XP: {xp}
-📝 Ishlangan testlar: {tests}
-✅ To'g'ri javoblar: {correct}
-                """
-            )
-
-    elif message.text == "🥇 Reyting":
-        cursor.execute("""
-            SELECT name, xp
-            FROM users
-            ORDER BY xp DESC
-            LIMIT 10
-        """)
-
-        results = cursor.fetchall()
-
-        text = "🏆 TOP 10 REYTING\n\n"
-
-        for i, (name, xp) in enumerate(results, 1):
-            text += f"{i}. {name} — {xp} XP\n"
-
-        bot.send_message(user_id, text)
-
-    elif message.text == "ℹ️ Bot haqida":
-        bot.send_message(
-            user_id,
-            "📚 Bilimdon Bot — bilimni sinash "
-            "va rivojlantirish uchun yaratilgan."
-        )
-
-
-# FAN TANLASH
-@bot.callback_query_handler(
-    func=lambda call: call.data.startswith("subject_")
-)
-def subject_selected(call):
-    index = int(call.data.split("_")[1])
-
+@bot.callback_query_handler(func=lambda call: call.data in ["start_order_flow", "order_tg_bot", "order_tg_bot_hard"])
+def handle_service_selection(call):
     bot.answer_callback_query(call.id)
+    if call.data == "start_order_flow":
+        bot.send_message(
+            call.message.chat.id,
+            "Qaysi xizmat turini buyurtma qilasiz?",
+            reply_markup=get_order_inline()
+        )
+        return
 
-    start_test(call, index)
+    key = call.data.replace("order_", "")
+    service = PRICES.get(key)
+    if not service:
+        return
 
+    user_states[call.from_user.id] = {
+        "step": "WAIT_PHONE",
+        "service_key": key,
+        "service_title": service["title"],
+        "price": service["price"]
+    }
 
-# Render Free Web Service uchun Health-Check web server
+    markup = types.ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
+    btn_phone = types.KeyboardButton("📱 Telefon raqamni yuborish", request_contact=True)
+    btn_cancel = types.KeyboardButton("❌ Bekor qilish")
+    markup.add(btn_phone)
+    markup.add(btn_cancel)
+
+    bot.send_message(
+        call.message.chat.id,
+        f"Siz tanladingiz: **{service['title']}**\nNarxi: **{service['price']}**\n\n"
+        "Iltimos, siz bilan bog'lanishimiz uchun telefon raqamingizni yuboring yoki yozib qoldiring:",
+        reply_markup=markup,
+        parse_mode="Markdown"
+    )
+
+@bot.message_handler(func=lambda msg: msg.text == "❌ Bekor qilish")
+def cancel_order(message):
+    user_states.pop(message.from_user.id, None)
+    bot.send_message(
+        message.chat.id,
+        "Buyurtma bekor qilindi. Bosh menyuga qaytdingiz.",
+        reply_markup=get_main_keyboard()
+    )
+
+@bot.message_handler(content_types=['contact', 'text'])
+def handle_order_flow(message):
+    user_id = message.from_user.id
+    state = user_states.get(user_id)
+
+    if not state:
+        if message.text not in [
+            "🤖 Telegram bot (80,000 so'm)",
+            "⚙️ Og'ir bot (130,000 so'm)",
+            "💰 Barcha narxlar",
+            "✍️ Buyurtma berish",
+            "📞 Bog'lanish"
+        ]:
+            bot.send_message(
+                message.chat.id,
+                "Kerakli bo'limni menyudan tanlang 👇",
+                reply_markup=get_main_keyboard()
+            )
+        return
+
+    step = state.get("step")
+
+    if step == "WAIT_PHONE":
+        if message.contact:
+            phone = message.contact.phone_number
+        else:
+            phone = message.text.strip()
+
+        state["phone"] = phone
+        state["step"] = "WAIT_COMMENT"
+
+        markup = types.ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
+        markup.add(types.KeyboardButton("⏩ O'tkazib yuborish"))
+        markup.add(types.KeyboardButton("❌ Bekor qilish"))
+
+        bot.send_message(
+            message.chat.id,
+            "Rahmat! Bot haqida qanday qo'shimcha talablaringiz bo'lsa yozib qoldiring "
+            "(yoki '⏩ O'tkazib yuborish' tugmasini bosing):",
+            reply_markup=markup
+        )
+
+    elif step == "WAIT_COMMENT":
+        if message.text == "⏩ O'tkazib yuborish":
+            comment = "Qo'shimcha izoh yo'q"
+        else:
+            comment = message.text
+
+        state["comment"] = comment
+        user = message.from_user
+
+        with db_lock:
+            cursor.execute("""
+            INSERT INTO orders (user_id, username, full_name, service_type, price, phone, comment)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, (
+                user.id,
+                f"@{user.username}" if user.username else "Mavjud emas",
+                user.full_name,
+                state["service_title"],
+                state["price"],
+                state["phone"],
+                state["comment"]
+            ))
+            db.commit()
+
+        success_text = (
+            "✅ **Buyurtmangiz qabul qilindi!**\n\n"
+            f"📌 **Xizmat:** {state['service_title']}\n"
+            f"💰 **Narxi:** {state['price']}\n"
+            f"📱 **Telefon:** {state['phone']}\n"
+            f"📝 **Izoh:** {state['comment']}\n\n"
+            "Tez orada siz bilan bog'lanamiz. Rahmat!"
+        )
+
+        bot.send_message(
+            message.chat.id,
+            success_text,
+            reply_markup=get_main_keyboard(),
+            parse_mode="Markdown"
+        )
+
+        if ADMIN_ID:
+            admin_msg = (
+                "🔔 **Yangi buyurtma!**\n\n"
+                f"👤 Mijoz: {user.full_name} ({f'@{user.username}' if user.username else 'usernamesiz'})\n"
+                f"🆔 ID: `{user.id}`\n"
+                f"📌 Xizmat: {state['service_title']}\n"
+                f"💰 Narx: {state['price']}\n"
+                f"📱 Telefon: `{state['phone']}`\n"
+                f"📝 Izoh: {state['comment']}"
+            )
+            try:
+                bot.send_message(ADMIN_ID, admin_msg, parse_mode="Markdown")
+            except Exception:
+                pass
+
+        user_states.pop(user_id, None)
+
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.send_header("Content-type", "text/plain; charset=utf-8")
         self.end_headers()
-        self.wfile.write(b"Bilimdon Bot muvaffaqiyatli ishlamoqda!")
+        self.wfile.write(b"Bot muvaffaqiyatli ishlamoqda!")
 
     def log_message(self, format, *args):
-        # Consolega ortiqcha ping xabarlarini chiqarmaydi
         return
-
 
 def run_health_server():
     port = int(os.environ.get("PORT", 8080))
     server = HTTPServer(("0.0.0.0", port), HealthCheckHandler)
     server.serve_forever()
 
-
 if __name__ == "__main__":
-    # Render port tekshiruvidan o'tishi uchun alohida oqimda veb-server ishga tushiramiz
-    threading.Thread(target=run_health_server, daemon=True).start()
+    threading.Thread(
+        target=run_health_server,
+        daemon=True
+    ).start()
 
-    print("BILIMDON BOT ISHGA TUSHDI!")
+    print("TELEGRAM BOT YARATISH VA NARXLAR BOTI ISHGA TUSHDI!")
     bot.infinity_polling(skip_pending=True)
