@@ -1,335 +1,452 @@
 import os
-import sqlite3
-import threading
-from http.server import BaseHTTPRequestHandler, HTTPServer
+import re
+import uuid
+import asyncio
+import logging
+from typing import Optional, List, Dict
 
-import telebot
-from telebot import types
+import yt_dlp
+from shazamio import Shazam
+import imageio_ffmpeg
+
+from aiogram import Bot, Dispatcher, F, types
+from aiogram.filters import CommandStart, Command
+from aiogram.types import (
+    Message,
+    CallbackQuery,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
+    FSInputFile,
+    InlineQuery,
+    InlineQueryResultAudio,
+    InlineQueryResultArticle,
+    InputTextMessageContent
+)
 from dotenv import load_dotenv
 
+# .env faylini yuklaymiz
 load_dotenv()
 
-TOKEN = os.getenv("BOT_TOKEN")
-ADMIN_ID = os.getenv("ADMIN_ID")  # ixtiyoriy admin ID
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+if not BOT_TOKEN:
+    raise ValueError("BOT_TOKEN topilmadi! .env faylida BOT_TOKEN ni belgilang.")
 
-if not TOKEN:
-    raise ValueError("BOT_TOKEN topilmadi! .env faylini tekshiring.")
+# Logging sozlamalari
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
-bot = telebot.TeleBot(TOKEN)
+# FFMPEG yo'lini aniqlash (Tizimda bo'lmasa imageio-ffmpeg dan oladi)
+FFMPEG_PATH = imageio_ffmpeg.get_ffmpeg_exe()
 
-# DATABASE
-db = sqlite3.connect("services.db", check_same_thread=False)
-cursor = db.cursor()
-db_lock = threading.Lock()
+# Yuklab olinadigan audio fayllar uchun vaqtinchalik papka
+DOWNLOAD_DIR = "downloads"
+os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
-with db_lock:
-    cursor.execute("""
-    CREATE TABLE IF NOT EXISTS orders (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id INTEGER,
-        username TEXT,
-        full_name TEXT,
-        service_type TEXT,
-        price TEXT,
-        phone TEXT,
-        comment TEXT,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    )
-    """)
-    cursor.execute("""
-    CREATE TABLE IF NOT EXISTS users (
-        user_id INTEGER PRIMARY KEY,
-        full_name TEXT,
-        username TEXT
-    )
-    """)
-    db.commit()
+bot = Bot(token=BOT_TOKEN)
+dp = Dispatcher()
+shazam = Shazam()
 
-# Holatlar (oddiy dict)
-user_states = {}
+# Havolalarni (URL) aniqlash uchun regex
+URL_REGEX = re.compile(
+    r'^(https?:\/\/)?'  # http:// yoki https://
+    r'([a-zA-Z0-9-]+\.)+[a-zA-Z]{2,}'  # domen nomi
+    r'(:\d+)?(\/.*)?$',
+    re.IGNORECASE
+)
 
-PRICES = {
-    "tg_bot": {
-        "title": "🤖 Telegram bot yaratish",
-        "price": "80,000 so'm",
-        "desc": (
-            "Oddiy va qulay Telegram bot:\n"
-            "• Menyu va chiroyli tugmalar\n"
-            "• Foydalanuvchilar bilan qulay muloqot\n"
-            "• Ma'lumotlar bazasi (SQLite) va buyurtmalarni saqlash\n"
-            "• Tezkor va barqaror ishlash"
-        )
-    },
-    "tg_bot_hard": {
-        "title": "⚙️ Og'ir (murakkab) Telegram bot",
-        "price": "130,000 so'm",
-        "desc": (
-            "Katta imkoniyatlarga ega og'ir Telegram bot:\n"
-            "• Murakkab mantiq va ko'p bosqichli FSM tizimi\n"
-            "• To'lov tizimlari va tashqi API integratsiyalari\n"
-            "• Kengaytirilgan admin boshqaruvi va statistika\n"
-            "• Serverda 24/7 uzluksiz ishlash imkoniyati"
-        )
-    }
-}
+# Inline query yoki boshqa xabarlar uchun audio xotira kesh (id -> audio_url/file_id)
+# Maqsad: inline query yoki qayta yuklab olishda tezkor ishlash
+AUDIO_CACHE: Dict[str, dict] = {}
 
-def get_main_keyboard():
-    markup = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
-    btn_bot = types.KeyboardButton("🤖 Telegram bot (80,000 so'm)")
-    btn_hard_bot = types.KeyboardButton("⚙️ Og'ir bot (130,000 so'm)")
-    btn_prices = types.KeyboardButton("💰 Barcha narxlar")
-    btn_order = types.KeyboardButton("✍️ Buyurtma berish")
-    btn_contact = types.KeyboardButton("📞 Bog'lanish")
-    markup.add(btn_bot, btn_hard_bot)
-    markup.add(btn_prices, btn_order)
-    markup.add(btn_contact)
-    return markup
 
-def get_order_inline():
-    markup = types.InlineKeyboardMarkup(row_width=1)
-    markup.add(
-        types.InlineKeyboardButton("🤖 Telegram bot — 80,000 so'm", callback_data="order_tg_bot"),
-        types.InlineKeyboardButton("⚙️ Og'ir Telegram bot — 130,000 so'm", callback_data="order_tg_bot_hard")
-    )
-    return markup
+def create_music_keyboard(song_title: str, query_id: str, web_url: Optional[str] = None) -> InlineKeyboardMarkup:
+    """
+    Har bir musiqaga biriktiriladigan inline tugmalar:
+    1. Yuklab olish (Telegram ichida qayta saqlash/yuklash)
+    2. Do‘stlarga jo‘natish (switch_inline_query orqali)
+    3. Boshqa ilovalarga jo‘natish (Havola bo'lsa veb-brauzer yoki tashqi ilovada ochish)
+    """
+    buttons = [
+        [
+            InlineKeyboardButton(text="📥 Yuklab olish", callback_data=f"dl:{query_id}"),
+            InlineKeyboardButton(text="↗️ Do‘stlarga jo‘natish", switch_inline_query=song_title[:60])
+        ]
+    ]
+    if web_url:
+        buttons.append([
+            InlineKeyboardButton(text="🌐 Boshqa ilovada ochish", url=web_url)
+        ])
+    else:
+        # Agar bevosita web_url bo'lmasa, qidiruv ssilkasi sifatida ochish
+        search_share_url = f"https://www.google.com/search?q={song_title.replace(' ', '+')}+music"
+        buttons.append([
+            InlineKeyboardButton(text="🌐 Boshqa ilovalarga jo‘natish", url=search_share_url)
+        ])
 
-@bot.message_handler(commands=['start', 'help'])
-def send_welcome(message):
-    user_id = message.from_user.id
-    full_name = message.from_user.full_name or "Mijoz"
-    username = message.from_user.username or ""
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
 
-    with db_lock:
-        cursor.execute(
-            "INSERT OR REPLACE INTO users (user_id, full_name, username) VALUES (?, ?, ?)",
-            (user_id, full_name, username)
-        )
-        db.commit()
 
-    text = (
-        f"Assalomu alaykum, {full_name}!\n\n"
-        "Telegram bot yaratish xizmati botiga xush kelibsiz.\n\n"
-        "📌 Bizning narxlar:\n"
-        "• 🤖 **Telegram bot yasash**: 80,000 so'm\n"
-        "• ⚙️ **Og'ir Telegram bot yasash**: 130,000 so'm\n\n"
-        "Kerakli bo'limni tanlang 👇"
-    )
-    bot.send_message(message.chat.id, text, reply_markup=get_main_keyboard(), parse_mode="Markdown")
+async def search_and_download_music(query: str, is_url: bool = False) -> Optional[dict]:
+    """
+    yt-dlp yordamida qo'shiq qidirish yoki havola orqali MP3 formatda yuklab olish.
+    """
+    unique_id = str(uuid.uuid4())[:8]
+    output_template = os.path.join(DOWNLOAD_DIR, f"{unique_id}_%(title).50s.%(ext)s")
 
-@bot.message_handler(func=lambda msg: msg.text == "💰 Barcha narxlar")
-def show_all_prices(message):
-    text = (
-        "📊 **Telegram bot yasash narxlari:**\n\n"
-        "1. 🤖 **Telegram bot yasash** — `80,000 so'm`\n"
-        "   - Menyu, tugmalar, aloqa va ma'lumotlar bazasi.\n\n"
-        "2. ⚙️ **Og'ir Telegram bot yasash** — `130,000 so'm`\n"
-        "   - Murakkab tizimlar, API, to'lovlar, maxsus admin boshqaruvi.\n\n"
-        "Buyurtma berish uchun quyidagi tugmani bosing:"
-    )
-    markup = types.InlineKeyboardMarkup()
-    markup.add(types.InlineKeyboardButton("✍️ Buyurtma berish", callback_data="start_order_flow"))
-    bot.send_message(message.chat.id, text, reply_markup=markup, parse_mode="Markdown")
-
-@bot.message_handler(func=lambda msg: msg.text == "🤖 Telegram bot (80,000 so'm)")
-def info_tg_bot(message):
-    item = PRICES["tg_bot"]
-    text = f"**{item['title']}**\n\n💵 **Narxi:** {item['price']}\n\n{item['desc']}"
-    markup = types.InlineKeyboardMarkup()
-    markup.add(types.InlineKeyboardButton("✍️ Buyurtma berish", callback_data="order_tg_bot"))
-    bot.send_message(message.chat.id, text, reply_markup=markup, parse_mode="Markdown")
-
-@bot.message_handler(func=lambda msg: msg.text == "⚙️ Og'ir bot (130,000 so'm)")
-def info_hard_bot(message):
-    item = PRICES["tg_bot_hard"]
-    text = f"**{item['title']}**\n\n💵 **Narxi:** {item['price']}\n\n{item['desc']}"
-    markup = types.InlineKeyboardMarkup()
-    markup.add(types.InlineKeyboardButton("✍️ Buyurtma berish", callback_data="order_tg_bot_hard"))
-    bot.send_message(message.chat.id, text, reply_markup=markup, parse_mode="Markdown")
-
-@bot.message_handler(func=lambda msg: msg.text == "📞 Bog'lanish")
-def contact_info(message):
-    text = (
-        "📞 **Biz bilan bog'lanish:**\n\n"
-        "Savollaringiz yoki buyurtmangiz bo'lsa murojaat qiling:\n\n"
-        "💬 Telegram: @admin\n"
-        "📱 Telefon: +998 (90) 123-45-67\n"
-        "⏰ Ish vaqti: 24/7"
-    )
-    bot.send_message(message.chat.id, text, parse_mode="Markdown")
-
-@bot.message_handler(func=lambda msg: msg.text == "✍️ Buyurtma berish")
-def order_start(message):
-    bot.send_message(
-        message.chat.id,
-        "Qaysi xizmat bo'yicha buyurtma bermoqchisiz? Tanlang:",
-        reply_markup=get_order_inline()
-    )
-
-@bot.callback_query_handler(func=lambda call: call.data in ["start_order_flow", "order_tg_bot", "order_tg_bot_hard"])
-def handle_service_selection(call):
-    bot.answer_callback_query(call.id)
-    if call.data == "start_order_flow":
-        bot.send_message(
-            call.message.chat.id,
-            "Qaysi xizmat turini buyurtma qilasiz?",
-            reply_markup=get_order_inline()
-        )
-        return
-
-    key = call.data.replace("order_", "")
-    service = PRICES.get(key)
-    if not service:
-        return
-
-    user_states[call.from_user.id] = {
-        "step": "WAIT_PHONE",
-        "service_key": key,
-        "service_title": service["title"],
-        "price": service["price"]
+    ydl_opts = {
+        'format': 'bestaudio/best',
+        'outtmpl': output_template,
+        'noplaylist': True,
+        'quiet': True,
+        'no_warnings': True,
+        'ffmpeg_location': FFMPEG_PATH,
+        'postprocessors': [{
+            'key': 'FFmpegExtractAudio',
+            'preferredcodec': 'mp3',
+            'preferredquality': '192',
+        }],
     }
 
-    markup = types.ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
-    btn_phone = types.KeyboardButton("📱 Telefon raqamni yuborish", request_contact=True)
-    btn_cancel = types.KeyboardButton("❌ Bekor qilish")
-    markup.add(btn_phone)
-    markup.add(btn_cancel)
+    search_target = query if is_url else f"ytsearch1:{query}"
 
-    bot.send_message(
-        call.message.chat.id,
-        f"Siz tanladingiz: **{service['title']}**\nNarxi: **{service['price']}**\n\n"
-        "Iltimos, siz bilan bog'lanishimiz uchun telefon raqamingizni yuboring yoki yozib qoldiring:",
-        reply_markup=markup,
-        parse_mode="Markdown"
-    )
+    loop = asyncio.get_running_loop()
 
-@bot.message_handler(func=lambda msg: msg.text == "❌ Bekor qilish")
-def cancel_order(message):
-    user_states.pop(message.from_user.id, None)
-    bot.send_message(
-        message.chat.id,
-        "Buyurtma bekor qilindi. Bosh menyuga qaytdingiz.",
-        reply_markup=get_main_keyboard()
-    )
-
-@bot.message_handler(content_types=['contact', 'text'])
-def handle_order_flow(message):
-    user_id = message.from_user.id
-    state = user_states.get(user_id)
-
-    if not state:
-        if message.text not in [
-            "🤖 Telegram bot (80,000 so'm)",
-            "⚙️ Og'ir bot (130,000 so'm)",
-            "💰 Barcha narxlar",
-            "✍️ Buyurtma berish",
-            "📞 Bog'lanish"
-        ]:
-            bot.send_message(
-                message.chat.id,
-                "Kerakli bo'limni menyudan tanlang 👇",
-                reply_markup=get_main_keyboard()
-            )
-        return
-
-    step = state.get("step")
-
-    if step == "WAIT_PHONE":
-        if message.contact:
-            phone = message.contact.phone_number
-        else:
-            phone = message.text.strip()
-
-        state["phone"] = phone
-        state["step"] = "WAIT_COMMENT"
-
-        markup = types.ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
-        markup.add(types.KeyboardButton("⏩ O'tkazib yuborish"))
-        markup.add(types.KeyboardButton("❌ Bekor qilish"))
-
-        bot.send_message(
-            message.chat.id,
-            "Rahmat! Bot haqida qanday qo'shimcha talablaringiz bo'lsa yozib qoldiring "
-            "(yoki '⏩ O'tkazib yuborish' tugmasini bosing):",
-            reply_markup=markup
-        )
-
-    elif step == "WAIT_COMMENT":
-        if message.text == "⏩ O'tkazib yuborish":
-            comment = "Qo'shimcha izoh yo'q"
-        else:
-            comment = message.text
-
-        state["comment"] = comment
-        user = message.from_user
-
-        with db_lock:
-            cursor.execute("""
-            INSERT INTO orders (user_id, username, full_name, service_type, price, phone, comment)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-            """, (
-                user.id,
-                f"@{user.username}" if user.username else "Mavjud emas",
-                user.full_name,
-                state["service_title"],
-                state["price"],
-                state["phone"],
-                state["comment"]
-            ))
-            db.commit()
-
-        success_text = (
-            "✅ **Buyurtmangiz qabul qilindi!**\n\n"
-            f"📌 **Xizmat:** {state['service_title']}\n"
-            f"💰 **Narxi:** {state['price']}\n"
-            f"📱 **Telefon:** {state['phone']}\n"
-            f"📝 **Izoh:** {state['comment']}\n\n"
-            "Tez orada siz bilan bog'lanamiz. Rahmat!"
-        )
-
-        bot.send_message(
-            message.chat.id,
-            success_text,
-            reply_markup=get_main_keyboard(),
-            parse_mode="Markdown"
-        )
-
-        if ADMIN_ID:
-            admin_msg = (
-                "🔔 **Yangi buyurtma!**\n\n"
-                f"👤 Mijoz: {user.full_name} ({f'@{user.username}' if user.username else 'usernamesiz'})\n"
-                f"🆔 ID: `{user.id}`\n"
-                f"📌 Xizmat: {state['service_title']}\n"
-                f"💰 Narx: {state['price']}\n"
-                f"📱 Telefon: `{state['phone']}`\n"
-                f"📝 Izoh: {state['comment']}"
-            )
+    def _extract():
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             try:
-                bot.send_message(ADMIN_ID, admin_msg, parse_mode="Markdown")
-            except Exception:
-                pass
+                info = ydl.extract_info(search_target, download=True)
+                if 'entries' in info:
+                    if not info['entries']:
+                        return None
+                    info = info['entries'][0]
 
-        user_states.pop(user_id, None)
+                # Yuklangan fayl nomini aniqlash
+                filename = ydl.prepare_filename(info)
+                # Kengaytmasi .mp3 ga o'zgaradi
+                base, _ = os.path.splitext(filename)
+                mp3_path = base + ".mp3"
 
-class HealthCheckHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.send_header("Content-type", "text/plain; charset=utf-8")
-        self.end_headers()
-        self.wfile.write(b"Bot muvaffaqiyatli ishlamoqda!")
+                return {
+                    "id": unique_id,
+                    "title": info.get("title", "Noma'lum musiqa"),
+                    "artist": info.get("uploader", info.get("channel", "Noma'lum ijrochi")),
+                    "duration": info.get("duration", 0),
+                    "file_path": mp3_path,
+                    "webpage_url": info.get("webpage_url", None)
+                }
+            except Exception as e:
+                logging.error(f"yt-dlp xatolik: {e}")
+                return None
 
-    def log_message(self, format, *args):
+    return await loop.run_in_executor(None, _extract)
+
+
+async def search_artist_top_tracks(artist_name: str, limit: int = 10) -> List[dict]:
+    """
+    Qo'shiqchi nomi bo'yicha eng mashhur 5-10 ta musiqasini qidirib topish.
+    """
+    ydl_opts = {
+        'extract_flat': 'in_playlist',
+        'skip_download': True,
+        'quiet': True,
+        'no_warnings': True,
+    }
+
+    loop = asyncio.get_running_loop()
+
+    def _get_tracks():
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            try:
+                search_query = f"ytsearch{limit}:{artist_name} audio"
+                res = ydl.extract_info(search_query, download=False)
+                tracks = []
+                if 'entries' in res and res['entries']:
+                    for entry in res['entries']:
+                        if entry:
+                            tracks.append({
+                                "id": entry.get("id"),
+                                "title": entry.get("title"),
+                                "url": entry.get("url") or f"https://www.youtube.com/watch?v={entry.get('id')}"
+                            })
+                return tracks
+            except Exception as e:
+                logging.error(f"Ijrochi musiqalarini qidirishda xatolik: {e}")
+                return []
+
+    return await loop.run_in_executor(None, _get_tracks)
+
+
+# ================== BOT BUYRUQLARI VA HANDLERLARI ==================
+
+@dp.message(CommandStart())
+async def cmd_start(message: Message):
+    """
+    /start buyrug'i uchun handler. Bot imkoniyatlari haqida to'liq yo'riqnoma beradi.
+    """
+    user_name = message.from_user.first_name if message.from_user else "Foydalanuvchi"
+    welcome_text = (
+        f"Assalomu alaykum, <b>{user_name}</b>! 🎵\n\n"
+        "Men sizning ko‘p funksiyali musiqa botingizman.\n\n"
+        "<b>Quyidagi imkoniyatlar mavjud:</b>\n"
+        "1️⃣ <b>Qo‘shiq qidirish:</b> Musiqa nomini yozing (masalan: <i>Xamdam Sobirov Yillar</i>)\n"
+        "2️⃣ <b>Havola orqali yuklash:</b> YouTube, Instagram, TikTok, SoundCloud va h.k. havolasini yuboring\n"
+        "3️⃣ <b>Videodan musiqani aniqlash (Shazam):</b> Video yoki dumaloq video (video note) yuboring\n"
+        "4️⃣ <b>Qo‘shiqchi musiqalari:</b> <code>/artist Qo‘shiqchi ismi</code> buyrug‘ini yuboring (masalan: <code>/artist Tohir Sodiqov</code>)\n\n"
+        "Kerakli musiqani topish uchun shunchaki matn, havola yoki video yuboring!"
+    )
+    await message.answer(welcome_text, parse_mode="HTML")
+
+
+@dp.message(Command("artist"))
+async def cmd_artist(message: Message):
+    """
+    4-band: Qo‘shiqchi ismi bo‘yicha musiqalarini chiqarish.
+    Foydalanish: /artist Qo'shiqchi ismi
+    """
+    args = message.text.split(maxsplit=1)
+    if len(args) < 2 or not args[1].strip():
+        await message.answer(
+            "Iltimos, ijrochi ismini kiriting!\n"
+            "Masalan: <code>/artist Sherali Jo'rayev</code> yoki <code>/artist Konsta</code>",
+            parse_mode="HTML"
+        )
         return
 
-def run_health_server():
-    port = int(os.environ.get("PORT", 8080))
-    server = HTTPServer(("0.0.0.0", port), HealthCheckHandler)
-    server.serve_forever()
+    artist_name = args[1].strip()
+    status_msg = await message.answer(f"🔎 <b>{artist_name}</b> ijrosidagi eng sara musiqalar qidirilmoqda...", parse_mode="HTML")
+
+    tracks = await search_artist_top_tracks(artist_name, limit=8)
+    if not tracks:
+        await status_msg.edit_text("❌ Ushbu ijrochi bo‘yicha musiqalar topilmadi.")
+        return
+
+    # Inline klaviatura tuzamiz
+    inline_keyboard = []
+    text_lines = [f"🎵 <b>{artist_name}</b> — Eng sara musiqalari:\n"]
+
+    for idx, track in enumerate(tracks, 1):
+        clean_title = track['title'][:55]
+        text_lines.append(f"{idx}. {clean_title}")
+        inline_keyboard.append([
+            InlineKeyboardButton(
+                text=f"▶️ {idx}. {clean_title}",
+                callback_data=f"yt:{track['id']}"
+            )
+        ])
+
+    keyboard = InlineKeyboardMarkup(inline_keyboard=inline_keyboard)
+    await status_msg.edit_text(
+        "\n".join(text_lines) + "\n\nKerakli musiqani yuklab olish uchun quyidagi tugmalardan birini bosing:",
+        reply_markup=keyboard,
+        parse_mode="HTML"
+    )
+
+
+@dp.message(F.video | F.video_note)
+async def handle_video_shazam(message: Message):
+    """
+    3-band: Video yoki Dumaloq video (video note) orqali musiqani aniqlash (Shazam funksiyasi)
+    va to'liq MP3 variantini topib yuborish.
+    """
+    status_msg = await message.answer("🎧 Videodagi musiqa aniqlanmoqda (Shazam)...")
+
+    temp_video = os.path.join(DOWNLOAD_DIR, f"shazam_{uuid.uuid4().hex[:8]}.mp4")
+    try:
+        # Video faylni yuklab olamiz
+        file_id = message.video.file_id if message.video else message.video_note.file_id
+        await bot.download(file_id, destination=temp_video)
+
+        # Shazam orqali tanish
+        out = await shazam.recognize(temp_video)
+        track = out.get("track")
+
+        if not track:
+            await status_msg.edit_text("😔 Kechirasiz, videodagi musiqani aniqlab bo‘lmadi.")
+            return
+
+        title = track.get("title", "")
+        subtitle = track.get("subtitle", "")
+        full_title = f"{subtitle} - {title}" if subtitle else title
+
+        await status_msg.edit_text(f"✅ Musiqa aniqlandi: <b>{full_title}</b>\n📥 To‘liq MP3 varianti yuklanmoqda...", parse_mode="HTML")
+
+        # Musiqaning to'liq MP3 formatini YouTube orqali qidirib yuklaymiz
+        music_data = await search_and_download_music(full_title, is_url=False)
+        if not music_data or not os.path.exists(music_data["file_path"]):
+            await status_msg.edit_text(f"✅ Musiqa nomi: <b>{full_title}</b>\n❌ Afsuski, musiqani yuklab olish imkoni bo‘lmadi.", parse_mode="HTML")
+            return
+
+        # Inline tugmalar yasaymiz
+        q_id = music_data["id"]
+        AUDIO_CACHE[q_id] = music_data
+        kb = create_music_keyboard(full_title, q_id, music_data.get("webpage_url"))
+
+        audio_file = FSInputFile(music_data["file_path"], filename=f"{full_title}.mp3")
+        await message.answer_audio(
+            audio=audio_file,
+            title=title,
+            performer=subtitle,
+            duration=music_data.get("duration", 0),
+            caption=f"🎵 <b>{full_title}</b>\n🔍 <i>Shazam orqali aniqlandi</i>",
+            reply_markup=kb,
+            parse_mode="HTML"
+        )
+        await status_msg.delete()
+
+        # Faylni o'chiramiz
+        if os.path.exists(music_data["file_path"]):
+            os.remove(music_data["file_path"])
+
+    except Exception as e:
+        logging.error(f"Shazam xatolik: {e}")
+        await status_msg.edit_text("❌ Videoni qayta ishlashda xatolik yuz berdi.")
+    finally:
+        if os.path.exists(temp_video):
+            os.remove(temp_video)
+
+
+@dp.callback_query(F.data.startswith("yt:"))
+async def callback_download_track(callback: CallbackQuery):
+    """
+    Qo'shiqchining musiqalar ro'yxatidan tanlangan trekni yuklab beruvchi callback handler.
+    """
+    track_id = callback.data.split(":", 1)[1]
+    url = f"https://www.youtube.com/watch?v={track_id}"
+
+    await callback.answer("Yuklanmoqda...")
+    status_msg = await callback.message.answer("⏳ Tanlangan musiqa yuklanmoqda, kuting...")
+
+    music_data = await search_and_download_music(url, is_url=True)
+    if not music_data or not os.path.exists(music_data["file_path"]):
+        await status_msg.edit_text("❌ Musiqani yuklab bo‘lmadi.")
+        return
+
+    q_id = music_data["id"]
+    AUDIO_CACHE[q_id] = music_data
+    kb = create_music_keyboard(music_data["title"], q_id, music_data.get("webpage_url"))
+
+    audio_file = FSInputFile(music_data["file_path"], filename=f"{music_data['title']}.mp3")
+    await callback.message.answer_audio(
+        audio=audio_file,
+        title=music_data["title"],
+        performer=music_data.get("artist"),
+        duration=music_data.get("duration", 0),
+        caption=f"🎵 <b>{music_data['title']}</b>",
+        reply_markup=kb,
+        parse_mode="HTML"
+    )
+    await status_msg.delete()
+
+    if os.path.exists(music_data["file_path"]):
+        os.remove(music_data["file_path"])
+
+
+@dp.callback_query(F.data.startswith("dl:"))
+async def callback_download_cached(callback: CallbackQuery):
+    """
+    'Yuklab olish' tugmasi bosilganda xabar berish yoki tasdiqlash.
+    """
+    await callback.answer("Ushbu musiqa allaqachon chatda yuklangan. Fayl ustiga bosib saqlab olishingiz mumkin! 💾", show_alert=True)
+
+
+@dp.message(F.text)
+async def handle_text_or_url(message: Message):
+    """
+    1-band: Qo‘shiq nomi bo‘yicha qidiruv
+    2-band: Havola (URL) orqali musiqa yuklash (noto'g'ri bo'lsa ogohlantirish)
+    """
+    text = message.text.strip()
+
+    # Agar matn URL manzil (havola) bo'lsa
+    if URL_REGEX.match(text):
+        status_msg = await message.answer("🔄 Havola tekshirilmoqda va audio ajratilmoqda...")
+
+        music_data = await search_and_download_music(text, is_url=True)
+
+        # Agar havoladan audio ajratib bo'lmasa yoki musiqa bo'lmagan sayt bo'lsa
+        if not music_data or not os.path.exists(music_data["file_path"]):
+            await status_msg.edit_text("⚠️ Bu musiqaning ssilkasi emas yoki ushbu havoladan audio yuklab bo‘lmadi.")
+            return
+
+        q_id = music_data["id"]
+        AUDIO_CACHE[q_id] = music_data
+        kb = create_music_keyboard(music_data["title"], q_id, music_data.get("webpage_url"))
+
+        audio_file = FSInputFile(music_data["file_path"], filename=f"{music_data['title']}.mp3")
+        await message.answer_audio(
+            audio=audio_file,
+            title=music_data["title"],
+            performer=music_data.get("artist"),
+            duration=music_data.get("duration", 0),
+            caption=f"🎵 <b>{music_data['title']}</b>\n🔗 <i>Havoladan yuklandi</i>",
+            reply_markup=kb,
+            parse_mode="HTML"
+        )
+        await status_msg.delete()
+
+        if os.path.exists(music_data["file_path"]):
+            os.remove(music_data["file_path"])
+        return
+
+    # Agar matn qo'shiq nomi bo'lsa (Qidiruv)
+    status_msg = await message.answer(f"🔍 <b>\"{text}\"</b> musiqasi qidirilmoqda...", parse_mode="HTML")
+
+    music_data = await search_and_download_music(text, is_url=False)
+    if not music_data or not os.path.exists(music_data["file_path"]):
+        await status_msg.edit_text("❌ Hech qanday musiqa topilmadi. Iltimos, boshqa nom bilan qidirib ko‘ring.")
+        return
+
+    q_id = music_data["id"]
+    AUDIO_CACHE[q_id] = music_data
+    kb = create_music_keyboard(music_data["title"], q_id, music_data.get("webpage_url"))
+
+    audio_file = FSInputFile(music_data["file_path"], filename=f"{music_data['title']}.mp3")
+    await message.answer_audio(
+        audio=audio_file,
+        title=music_data["title"],
+        performer=music_data.get("artist"),
+        duration=music_data.get("duration", 0),
+        caption=f"🎵 <b>{music_data['title']}</b>",
+        reply_markup=kb,
+        parse_mode="HTML"
+    )
+    await status_msg.delete()
+
+    if os.path.exists(music_data["file_path"]):
+        os.remove(music_data["file_path"])
+
+
+@dp.inline_query()
+async def inline_share_handler(inline_query: InlineQuery):
+    """
+    5-band: 'Do‘stlarga jo‘natish' (switch_inline_query) orqali boshqa chatlarga
+    tezda ulashish uchun Inline Query handler.
+    """
+    query = inline_query.query.strip()
+    if not query:
+        return
+
+    results = [
+        InlineQueryResultArticle(
+            id=str(uuid.uuid4()),
+            title=f"Musiqani ulashish: {query}",
+            input_message_content=InputTextMessageContent(
+                message_text=f"🎵 Do‘stim, ushbu musiqani tinglab ko‘r: <b>{query}</b>",
+                parse_mode="HTML"
+            ),
+            description="Ushbu musiqani do‘stlaringiz bilan bo‘lishing"
+        )
+    ]
+    await inline_query.answer(results=results, cache_time=5)
+
+
+async def main():
+    logging.info("Musiqa boti muvaffaqiyatli ishga tushdi!")
+    await bot.delete_webhook(drop_pending_updates=True)
+    await dp.start_polling(bot)
+
 
 if __name__ == "__main__":
-    threading.Thread(
-        target=run_health_server,
-        daemon=True
-    ).start()
-
-    print("TELEGRAM BOT YARATISH VA NARXLAR BOTI ISHGA TUSHDI!")
-    bot.infinity_polling(skip_pending=True)
+    try:
+        asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        logging.info("Bot to'xtatildi.")

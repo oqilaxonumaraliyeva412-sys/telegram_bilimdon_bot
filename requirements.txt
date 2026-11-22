@@ -1,3 +1,6 @@
-pyTelegramBotAPI
-python-dotenv
-
+aiogram>=3.14.0
+yt-dlp>=2024.11.04
+shazamio>=0.6.0
+python-dotenv>=1.0.0
+aiofiles>=24.1.0
+imageio-ffmpeg>=0.5.1
