@@ -56,3 +56,4 @@ yoki virtual muhitda:
 .\.venv\Scripts\python.exe main.py
 ```
 
+# AtelierMusicBot
